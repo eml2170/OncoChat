@@ -1,0 +1,1 @@
+Personal app to automatically download my own medical records and clinical documents from MyChart
