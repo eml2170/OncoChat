@@ -8,12 +8,15 @@ Requirements:
     pip install requests
 """
 
+import argparse
 import os
 import json
+import ssl
 import time
 import base64
 import hashlib
 import secrets
+import tempfile
 import webbrowser
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -24,11 +27,17 @@ import requests
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-CLIENT_ID     = "YOUR_CLIENT_ID"
-FHIR_BASE     = "https://mskmychart.mskcc.org/FHIR/api/FHIR/R4"
-REDIRECT_URI  = "http://localhost:3000/callback"
-OUTPUT_DIR    = Path("~/msk_records").expanduser()
-TOKEN_FILE    = Path("~/.msk_mychart_token.json").expanduser()
+CLIENT_ID_PROD     = "foo"
+CLIENT_ID_SANDBOX  = "bar"
+FHIR_BASE_PROD     = "https://epicproxy.et1353.epichosted.com/APIPROXYPRD/api/FHIR/R4"
+FHIR_BASE_SANDBOX  = "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"
+REDIRECT_URI       = "https://localhost:3000/callback"
+OUTPUT_DIR         = Path("~/msk_records").expanduser()
+TOKEN_FILE         = Path("~/.msk_mychart_token.json").expanduser()
+
+# Defaults — overridden by --sandbox
+FHIR_BASE = FHIR_BASE_PROD
+CLIENT_ID = CLIENT_ID_PROD
 
 # FHIR scopes needed for all document types
 SCOPES = " ".join([
@@ -53,6 +62,22 @@ def generate_pkce():
     challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
     return verifier, challenge
 
+# ── Self-signed cert for localhost HTTPS ──────────────────────────────────────
+
+def _generate_self_signed_cert():
+    """Generate a temporary self-signed cert for the localhost callback server."""
+    import subprocess
+    cert_dir = tempfile.mkdtemp()
+    certfile = os.path.join(cert_dir, "cert.pem")
+    keyfile  = os.path.join(cert_dir, "key.pem")
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", keyfile, "-out", certfile,
+        "-days", "1", "-nodes",
+        "-subj", "/CN=localhost",
+    ], check=True, capture_output=True)
+    return certfile, keyfile
+
 # ── OAuth flow ────────────────────────────────────────────────────────────────
 
 auth_code_result = {}
@@ -75,23 +100,54 @@ class CallbackHandler(BaseHTTPRequestHandler):
 
 def get_token_via_browser():
     """Open browser for MyChart login, capture token."""
-    # 1. Fetch Epic's OIDC discovery document
-    disco = requests.get(f"{FHIR_BASE}/.well-known/openid-configuration", timeout=10)
-    if not disco.ok:
-        # Fallback to well-known Epic endpoints
-        auth_endpoint  = f"{FHIR_BASE.replace('/FHIR/api/FHIR/R4','')}/oauth2/authorize"
-        token_endpoint = f"{FHIR_BASE.replace('/FHIR/api/FHIR/R4','')}/oauth2/token"
-    else:
-        meta = disco.json()
-        auth_endpoint  = meta["authorization_endpoint"]
-        token_endpoint = meta["token_endpoint"]
+    # 1. Discover OAuth endpoints via FHIR metadata / SMART configuration
+    auth_endpoint  = None
+    token_endpoint = None
 
-    # Also try the SMART metadata endpoint
-    smart = requests.get(f"{FHIR_BASE}/.well-known/smart-configuration", timeout=10)
-    if smart.ok:
-        meta = smart.json()
-        auth_endpoint  = meta.get("authorization_endpoint", auth_endpoint)
-        token_endpoint = meta.get("token_endpoint",         token_endpoint)
+    # Try SMART well-known configuration (most reliable for Epic)
+    try:
+        smart = requests.get(f"{FHIR_BASE}/.well-known/smart-configuration", timeout=10)
+        if smart.ok:
+            meta = smart.json()
+            auth_endpoint  = meta.get("authorization_endpoint")
+            token_endpoint = meta.get("token_endpoint")
+    except requests.RequestException:
+        pass
+
+    # Try OIDC discovery
+    if not auth_endpoint:
+        try:
+            disco = requests.get(f"{FHIR_BASE}/.well-known/openid-configuration", timeout=10)
+            if disco.ok:
+                meta = disco.json()
+                auth_endpoint  = meta.get("authorization_endpoint")
+                token_endpoint = meta.get("token_endpoint")
+        except requests.RequestException:
+            pass
+
+    # Try FHIR capability statement (metadata endpoint, required by spec)
+    if not auth_endpoint:
+        try:
+            cap = requests.get(f"{FHIR_BASE}/metadata", headers={"Accept": "application/fhir+json"}, timeout=10)
+            if cap.ok:
+                for rest in cap.json().get("rest", []):
+                    security = rest.get("security", {})
+                    for ext in security.get("extension", []):
+                        if ext.get("url") == "http://fhir-registry.smarthealthit.org/StructureDefinition/oauth-uris":
+                            for sub in ext.get("extension", []):
+                                if sub.get("url") == "authorize":
+                                    auth_endpoint = sub.get("valueUri")
+                                elif sub.get("url") == "token":
+                                    token_endpoint = sub.get("valueUri")
+        except requests.RequestException:
+            pass
+
+    # Fallback to well-known Epic endpoint pattern
+    if not auth_endpoint:
+        oauth_base     = FHIR_BASE.replace("/api/FHIR/R4", "")
+        auth_endpoint  = f"{oauth_base}/oauth2/authorize"
+        token_endpoint = f"{oauth_base}/oauth2/token"
+        print(f"⚠️  Could not auto-discover OAuth endpoints, using fallback: {auth_endpoint}")
 
     verifier, challenge = generate_pkce()
     state = secrets.token_urlsafe(16)
@@ -111,8 +167,12 @@ def get_token_via_browser():
     print("\n🌐  Opening MyChart login in your browser...")
     webbrowser.open(url)
 
-    # 2. Wait for redirect
+    # 2. Wait for redirect (HTTPS with self-signed cert for localhost)
     server = HTTPServer(("localhost", 3000), CallbackHandler)
+    certfile, keyfile = _generate_self_signed_cert()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile, keyfile)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
     server.timeout = 120
     print("⏳  Waiting for MyChart login (2-minute timeout)...")
     server.handle_request()
@@ -357,8 +417,25 @@ def sync(token):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    print("🏥  MSK MyChart Sync")
+def main():
+    global FHIR_BASE, CLIENT_ID
+
+    parser = argparse.ArgumentParser(description="MSK MyChart FHIR Document Sync")
+    parser.add_argument("--sandbox", action="store_true",
+                        help="Use Epic's sandbox environment instead of MSK production")
+    args = parser.parse_args()
+
+    if args.sandbox:
+        FHIR_BASE = FHIR_BASE_SANDBOX
+        CLIENT_ID = CLIENT_ID_SANDBOX
+        print("🏥  MSK MyChart Sync (SANDBOX)")
+    else:
+        print("🏥  MSK MyChart Sync")
+    print(f"    FHIR endpoint: {FHIR_BASE}")
     print("=" * 40)
     token = get_valid_token()
     sync(token)
+
+
+if __name__ == "__main__":
+    main()
